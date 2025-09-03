@@ -18,8 +18,8 @@ type sendMessageRequest struct {
 
 var rootCmd = &cobra.Command{
 	Use:   "sendtg [chat_id] [message]",
-	Short: "Відправляє повідомлення у Telegram",
-	Long:  `sendtg — це консольна утиліта для швидкого надсилання повідомлень у Telegram.`,
+	Short: "Sends Telegram message",
+	Long:  `sendtg — is console utility for Telegram message sending.`,
 	Args:  cobra.MaximumNArgs(2),
 	RunE: func(cmd *cobra.Command, args []string) error {
 
@@ -28,7 +28,7 @@ var rootCmd = &cobra.Command{
 		}
 
 		if len(args) != 2 {
-			fmt.Println("Помилка: потрібно вказати chat_id та message")
+			fmt.Println("Error: chat_id and message must be specified")
 			return cmd.Help()
 		}
 
@@ -36,7 +36,7 @@ var rootCmd = &cobra.Command{
 
 		token := getBotToken(cmd)
 		if token == "" {
-			return fmt.Errorf("TELEGRAM_BOT_TOKEN не знайдено. Передайте --token або додайте у ENV/.env")
+			return fmt.Errorf("TELEGRAM_BOT_TOKEN not found. Please provide --token or add it to ENV/.env")
 		}
 
 		chatID := args[0]
@@ -48,7 +48,7 @@ var rootCmd = &cobra.Command{
 
 func init() {
 
-	rootCmd.Flags().StringP("token", "t", "", "Telegram Bot Token (найвищий пріоритет)")
+	rootCmd.Flags().StringP("token", "t", "", "Telegram Bot Token (highest priority)")
 
 	rootCmd.AddCommand(completionCmd)
 	rootCmd.AddCommand(versionCmd)
@@ -84,10 +84,10 @@ func sendMessage(token, chatID, text string) error {
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("Telegram API повернув статус %d", resp.StatusCode)
+		return fmt.Errorf("Telegram API returned status %d", resp.StatusCode)
 	}
 
-	fmt.Println("✅ Повідомлення надіслано!")
+	fmt.Println("✅ Message sent successfully!")
 	return nil
 }
 
