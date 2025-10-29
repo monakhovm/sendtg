@@ -87,7 +87,7 @@ func sendMessage(token, chatID, text string) error {
 		return fmt.Errorf("Telegram API returned status %d", resp.StatusCode)
 	}
 
-	fmt.Println("✅ Message sent successfully!")
+	// fmt.Println("✅ Message sent successfully!")
 	return nil
 }
 
