@@ -1,11 +1,9 @@
 name: Redeliver Failed Webhook for This Event
 
 on:
-  # ДОДАЙ сюди всі події, після яких хочеш перевірку/перевідправку
   push:
   pull_request:
-    types: [opened, reopened, synchronize, closed, edited, labeled, unlabeled]
-  # за потреби додай інші події з docs
+    types: [opened, reopened, closed]
 
 jobs:
   check_and_redeliver:
@@ -14,180 +12,185 @@ jobs:
       contents: read
 
     steps:
-      - name: 🔄 Перевірка та повторна відправка вебхука для поточної події
+      - name: 🔄 Послідовна перевірка та перевідправка для всіх вебхуків
         uses: actions/github-script@v7
         with:
-          github-token: ${{ secrets.WEBHOOK_ADMIN_TOKEN }} # PAT/FGT з правами на Webhooks Read+Write
+          github-token: ${{ secrets.WEBHOOK_ADMIN_TOKEN }} # має мати Webhooks Read + Write
           script: |
-            const MAX_ATTEMPTS = 10;
-            const RECENT_SECONDS = 15 * 60; // 15 хв вікно на індексацію
-            const BASE_DELAY_MS = 3000;     // стартовий інтервал перед перевіркою нової доставки
-            const headers = { 'X-GitHub-Api-Version': '2022-11-28' };
+            // ----- ПАРАМЕТРИ -----
+            const MAX_ATTEMPTS = 3;
+            const RECENT_SECONDS = 15 * 60; // 15 хв — вікно для "цієї" події
+            const BASE_DELAY_MS = 3000;     // стартовий backoff, зростає експоненційно до 30s
+            const API_VERSION = '2022-11-28';
 
+            // ----- КОНТЕКСТ -----
             const { owner, repo } = context.repo;
-            const eventName = context.eventName; // push, pull_request, issues, release, ...
+            const eventName = context.eventName;
             const now = Date.now();
+            const headers = { 'X-GitHub-Api-Version': API_VERSION };
 
-            // Витягуємо "ключ" для поточної події, щоб зіставити з payload доставки
-            function eventKeyFromContext() {
+            // ----- УТИЛІТИ API -----
+            const listRepoHooks = async () => {
+              const { data } = await github.request('GET /repos/{owner}/{repo}/hooks', { owner, repo, headers });
+              return data;
+            };
+            const listDeliveries = async (hookId, perPage = 100) => {
+              const { data } = await github.request('GET /repos/{owner}/{repo}/hooks/{hook_id}/deliveries', {
+                owner, repo, hook_id: hookId, per_page: perPage, headers
+              });
+              return data;
+            };
+            const getDelivery = async (hookId, deliveryId) => {
+              const { data } = await github.request('GET /repos/{owner}/{repo}/hooks/{hook_id}/deliveries/{delivery_id}', {
+                owner, repo, hook_id: hookId, delivery_id: deliveryId, headers
+              });
+              return data;
+            };
+            const triggerRedelivery = async (hookId, deliveryId) => {
+              await github.request('POST /repos/{owner}/{repo}/hooks/{hook_id}/deliveries/{delivery_id}/attempts', {
+                owner, repo, hook_id: hookId, delivery_id: deliveryId, headers
+              });
+            };
+
+            // ----- ХЕЛПЕРИ ПОРІВНЯННЯ -----
+            const isRecent = iso => {
+              const t = Date.parse(iso);
+              return Number.isFinite(t) && ((now - t) / 1000) <= RECENT_SECONDS;
+            };
+            const isSuccess = d => d.status === 'OK' && d.status_code >= 200 && d.status_code < 300;
+
+            // Поточний "ключ" події для зіставлення з payload-ом доставки
+            const thisKey = (() => {
               const p = context.payload;
               switch (eventName) {
                 case 'pull_request':
                   return { event: 'pull_request', action: p.action, pr: p.pull_request?.number };
                 case 'push':
-                  // співставляємо за after SHA і ref
                   return { event: 'push', after: p.after, ref: p.ref };
                 default:
-                  // За потреби додай інші події
                   return { event: eventName };
               }
-            }
+            })();
 
-            function isRecent(iso) {
-              const t = Date.parse(iso);
-              return Number.isFinite(t) && ((now - t) / 1000) <= RECENT_SECONDS;
-            }
-
-            function isSuccess(delivery) {
-              return delivery.status === 'OK' && delivery.status_code >= 200 && delivery.status_code < 300;
-            }
-
-            async function listRepoHooks() {
-              const { data } = await github.request('GET /repos/{owner}/{repo}/hooks', { owner, repo, headers });
-              return data;
-            }
-
-            async function listDeliveries(hookId, perPage = 100) {
-              const { data } = await github.request(
-                'GET /repos/{owner}/{repo}/hooks/{hook_id}/deliveries',
-                { owner, repo, hook_id: hookId, per_page: perPage, headers }
-              );
-              return data;
-            }
-
-            async function getDelivery(hookId, deliveryId) {
-              const { data } = await github.request(
-                'GET /repos/{owner}/{repo}/hooks/{hook_id}/deliveries/{delivery_id}',
-                { owner, repo, hook_id: hookId, delivery_id: deliveryId, headers }
-              );
-              return data;
-            }
-
-            async function redeliver(hookId, deliveryId) {
-              // повертає 202 Accepted
-              await github.request(
-                'POST /repos/{owner}/{repo}/hooks/{hook_id}/deliveries/{delivery_id}/attempts',
-                { owner, repo, hook_id: hookId, delivery_id: deliveryId, headers }
-              );
-            }
-
-            // Порівняння payload доставки з поточним контекстом
-            function matchesThisEvent(fullDelivery, thisKey) {
+            const matchesThisEvent = (fullDelivery, key) => {
+              if (fullDelivery.event !== key.event) return false;
               const req = fullDelivery?.request?.payload || {};
-              if (fullDelivery.event !== thisKey.event) return false;
-
-              switch (thisKey.event) {
+              switch (key.event) {
                 case 'pull_request':
-                  return req.action === thisKey.action &&
-                         req.pull_request?.number === thisKey.pr;
+                  return req.action === key.action && req.pull_request?.number === key.pr;
                 case 'issues':
-                  return req.action === thisKey.action &&
-                         req.issue?.number === thisKey.issue;
+                  return req.action === key.action && req.issue?.number === key.issue;
                 case 'issue_comment':
-                  // звіряємо issue і (опційно) коментар
-                  if (req.action !== thisKey.action) return false;
-                  if (typeof thisKey.issue === 'number' && req.issue?.number !== thisKey.issue) return false;
+                  if (req.action !== key.action) return false;
+                  if (typeof key.issue === 'number' && req.issue?.number !== key.issue) return false;
                   return true;
                 case 'push':
-                  // деякі payload-и можуть не мати 'after' у доставці, але мають ref
-                  if (thisKey.after && req.after && req.after !== thisKey.after) return false;
-                  if (thisKey.ref && req.ref && req.ref !== thisKey.ref) return false;
+                  if (key.after && req.after && req.after !== key.after) return false;
+                  if (key.ref && req.ref && req.ref !== key.ref) return false;
                   return true;
                 case 'release':
-                  if (req.action !== thisKey.action) return false;
-                  if (thisKey.id && req.release?.id !== thisKey.id) return false;
-                  if (thisKey.tag && req.release?.tag_name !== thisKey.tag) return false;
+                  if (req.action !== key.action) return false;
+                  if (key.id && req.release?.id !== key.id) return false;
+                  if (key.tag && req.release?.tag_name !== key.tag) return false;
                   return true;
                 default:
-                  // За замовчуванням: тільки збіг типу події
                   return true;
               }
-            }
+            };
 
-            const thisKey = eventKeyFromContext();
-
-            let anyTriggered = false;
-            const hooks = await listRepoHooks();
-
-            for (const hook of hooks) {
-              if (hook.active === false) continue;
-              if (Array.isArray(hook.events) && !hook.events.includes(thisKey.event) && !hook.events.includes('*')) continue;
-
-              // 1) Беремо недавні доставки для цього hook
-              const recent = (await listDeliveries(hook.id, 100))
-                .filter(d => d.event === thisKey.event && isRecent(d.delivered_at))
+            // ----- ПОШУК ОСТАННЬОЇ ВІДПОВІДНОЇ ДОСТАВКИ ДЛЯ КОНКРЕТНОГО ХУКА -----
+            const findLatestMatchingDelivery = async (hookId, key) => {
+              const candidates = (await listDeliveries(hookId, 100))
+                .filter(d => d.event === key.event && isRecent(d.delivered_at))
                 .sort((a,b) => Date.parse(b.delivered_at) - Date.parse(a.delivered_at));
-
-              // 2) Знаходимо останню доставку саме для нашого ресурсу/дії
-              let lastMatch = null;
-              for (const cand of recent) {
-                const full = await getDelivery(hook.id, cand.id); // щоб мати payload.action, pr/issue/sha тощо
-                if (matchesThisEvent(full, thisKey)) { lastMatch = full; break; }
+              for (const cand of candidates) {
+                const full = await getDelivery(hookId, cand.id);
+                if (matchesThisEvent(full, key)) return full;
               }
-              if (!lastMatch) continue;
+              return null;
+            };
 
-              // 3) Якщо вже успішно — ок
-              if (isSuccess(lastMatch)) continue;
+            // ----- ОСНОВНА ФУНКЦІЯ РЕДОСТАВКИ ДЛЯ ОДНОГО ВЕБХУКА -----
+            async function redeliverForHook(hook, key) {
+              // пропустити, якщо хук не активний або не слухає цю подію
+              if (hook.active === false) return { processed: false, message: 'inactive' };
+              if (Array.isArray(hook.events) && !hook.events.includes(key.event) && !hook.events.includes('*')) {
+                return { processed: false, message: 'event not subscribed' };
+              }
 
-              // 4) Інакше — редоставка з полінгом (≤10 разів)
-              anyTriggered = true;
+              const last = await findLatestMatchingDelivery(hook.id, key);
+              if (!last) return { processed: true, message: 'no matching recent delivery' };
+              if (isSuccess(last)) return { processed: true, message: 'already successful' };
+
+              // редоставка з backoff до MAX_ATTEMPTS
               let attempts = 0;
-              let cursorId = lastMatch.id;
+              let cursorId = last.id;
 
               while (attempts < MAX_ATTEMPTS) {
                 attempts++;
-                core.info(`Webhook ${hook.id} -> redelivery attempt ${attempts} for delivery ${cursorId}`);
+                core.info(`Webhook ${hook.id} → attempt ${attempts} for delivery ${cursorId}`);
                 try {
-                  await redeliver(hook.id, cursorId); // 202 Accepted, створюється новий запис доставки
+                  await triggerRedelivery(hook.id, cursorId);
                 } catch (e) {
-                  core.setFailed(`Redelivery API error: ${e.message}`);
-                  break;
+                  const msg = `API error: ${e.message}`;
+                  core.warning(msg);
+                  return { processed: true, failed: true, message: msg };
                 }
 
-                // експоненційний backoff до ~3s * 2^n (cap 30s)
+                // експоненційний backoff (cap 30s)
                 const waitMs = Math.min(30000, BASE_DELAY_MS * (2 ** (attempts - 1)));
                 await new Promise(r => setTimeout(r, waitMs));
 
-                // Перечитуємо найновіші доставки й шукаємо САМЕ НАШУ подію
+                // перечитуємо верхівку доставок і шукаємо «нашу» найновішу
                 const head = (await listDeliveries(hook.id, 20))
                   .sort((a,b) => Date.parse(b.delivered_at) - Date.parse(a.delivered_at));
-
-                let newestFull = null;
+                let newest = null;
                 for (const d of head) {
-                  if (d.event !== thisKey.event || !isRecent(d.delivered_at)) continue;
+                  if (d.event !== key.event || !isRecent(d.delivered_at)) continue;
                   const full = await getDelivery(hook.id, d.id);
-                  if (matchesThisEvent(full, thisKey)) { newestFull = full; break; }
+                  if (matchesThisEvent(full, key)) { newest = full; break; }
                 }
 
-                if (!newestFull) {
-                  core.info('No matching new delivery found yet; will retry if attempts remain.');
+                if (!newest) {
+                  core.info('No matching new delivery yet; will retry.');
                   continue;
                 }
-
-                if (isSuccess(newestFull)) {
-                  core.info('✅ Webhook delivery succeeded after redelivery.');
-                  break;
+                if (isSuccess(newest)) {
+                  core.info(`✅ Hook ${hook.id}: success after ${attempts} attempt(s).`);
+                  return { processed: true, success: true };
                 }
-
-                // готуємось до наступної спроби від останнього запису
-                cursorId = newestFull.id;
-
-                if (attempts === MAX_ATTEMPTS) {
-                  core.setFailed(`❌ Webhook ${hook.id} (${hook.config?.url}) still failing after ${MAX_ATTEMPTS} attempts for ${thisKey.event}.`);
-                }
+                cursorId = newest.id; // продовжуємо від останнього
               }
+
+              const failMsg = `❌ Hook ${hook.id} (${hook.config?.url}) still failing after ${MAX_ATTEMPTS} attempts`;
+              core.warning(failMsg);
+              return { processed: true, failed: true, message: failMsg };
             }
 
-            if (!anyTriggered) {
+            // ----- ПОСЛІДОВНА ОБРОБКА ВСІХ ВЕБХУКІВ -----
+            const hooks = await listRepoHooks();
+            const relevantHooks = hooks.filter(h =>
+              h.active !== false &&
+              (!Array.isArray(h.events) || h.events.includes(thisKey.event) || h.events.includes('*'))
+            );
+
+            if (relevantHooks.length === 0) {
+              core.info('No active hooks subscribed to this event.');
+              return;
+            }
+
+            let anyTried = false;
+            let anyFailed = false;
+
+            for (const hook of relevantHooks) {
+              anyTried = true;
+              const res = await redeliverForHook(hook, thisKey); // ПО ЧЕРЗІ: await гарантує послідовність
+              if (res?.failed) anyFailed = true;
+            }
+
+            if (!anyTried) {
               core.info('No recent failed deliveries found for THIS event.');
+            }
+            if (anyFailed) {
+              core.setFailed('At least one webhook still failing after retries.');
             }
