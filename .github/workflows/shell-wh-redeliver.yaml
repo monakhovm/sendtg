@@ -1,0 +1,103 @@
+name: Redeliver Failed Webhooks SHELL version
+
+on:
+  workflow_dispatch:
+  push:
+  pull_request:
+
+jobs:
+  redeliver_failed_webhooks:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.WEBHOOK_ADMIN_TOKEN }}
+      REPOSITORY: ${{ github.repository }}
+      MAX_ATTEMPTS: 3
+    steps:
+      - name: 🔄 Redeliver failed webhooks (fast)
+        shell: bash
+        run: |
+          #!/usr/bin/env bash
+
+          MAX_ATTEMPTS=$MAX_ATTEMPTS
+          REPOSITORY=$REPOSITORY
+          declare -a FAILED_WEBHOOKS
+
+          sleep 3
+
+          get_hooks() {
+            echo $(curl \
+              -sf \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "https://api.github.com/repos/${REPOSITORY}/hooks?per_page=100" | \
+              jq -r '.[].id')
+          }
+
+          get_last_delivery() {
+            local HOOK_ID=$1
+            echo $(curl \
+              -sf \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "https://api.github.com/repos/${REPOSITORY}/hooks/${HOOK_ID}/deliveries?per_page=1" | \
+              jq -r '.[0] | {"id": .id, "status": .status_code}')
+          }
+
+          redeliver_hook() {
+            local HOOK_ID=$1
+            local DELIVERY_ID=$2
+            curl -sL \
+              -X POST \
+              -H "Accept: application/vnd.github+json" \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "https://api.github.com/repos/${REPOSITORY}/hooks/${HOOK_ID}/deliveries/${DELIVERY_ID}/attempts" > /dev/null
+          }
+
+          get_failed_hooks() {
+            local WEBHOOKS
+            WEBHOOKS=$(get_hooks)
+            FAILED_WEBHOOKS=()
+
+            for WEBHOOK_ID in $WEBHOOKS; do
+              LAST_DELIVERY=$(get_last_delivery "$WEBHOOK_ID")
+              DELIVERY_ID=$(echo "$LAST_DELIVERY" | jq -r '.id')
+              STATUS_CODE=$(echo "$LAST_DELIVERY" | jq -r '.status')
+
+              if [[ $STATUS_CODE -gt 399 ]]; then
+                FAILED_WEBHOOKS+=("$WEBHOOK_ID:$DELIVERY_ID")
+              fi
+            done
+          }
+
+          get_failed_hooks
+
+          if [[ ${#FAILED_WEBHOOKS[@]} -ne 0 ]]; then
+            for ATTEMPT in $(seq 1 $MAX_ATTEMPTS); do
+              echo "Redelivery attempt $ATTEMPT"
+
+              for FAILED_HOOK in "${FAILED_WEBHOOKS[@]}"; do
+                IFS=':' read -r HOOK_ID DELIVERY_ID <<< "$FAILED_HOOK"
+                echo -e "\tRedelivering hook $HOOK_ID (delivery $DELIVERY_ID)..."
+                redeliver_hook "$HOOK_ID" "$DELIVERY_ID"
+              done
+
+              sleep 3
+              get_failed_hooks
+
+              if [[ ${#FAILED_WEBHOOKS[@]} -eq 0 ]]; then
+                echo "All failed webhooks have been redelivered successfully."
+                exit 0
+              else
+                echo "${#FAILED_WEBHOOKS[@]} webhooks still failed."
+              fi
+            done
+
+            echo "Some webhooks could not be redelivered after $MAX_ATTEMPTS attempts."
+            exit 1
+          else
+            echo "No failed webhooks found."
+            exit 0
+          fi
